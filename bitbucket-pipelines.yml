@@ -1,0 +1,109 @@
+definitions:
+  services: 
+    mysql: 
+      image: mysql:5.7 
+      environment: 
+        MYSQL_DATABASE: 'pipelines_test'
+        MYSQL_RANDOM_ROOT_PASSWORD: 'yes' 
+        MYSQL_USER: 'test_user'
+        MYSQL_PASSWORD: 'test_user_password'
+  steps:
+    - step: &lintAndTest
+        name: Dependencies install, Lint and Test
+        image: php:8.0-fpm
+        caches:
+          - composer
+        script:
+          # Allow root/super user to run composer
+          - export COMPOSER_ALLOW_SUPERUSER=1
+
+          # Install Bitbucket Docker container dependencies
+          - apt-get update && apt-get install -qy git curl libpng-dev zlib1g-dev libmcrypt-dev zip unzip mariadb-client
+          - docker-php-ext-install pdo_mysql gd
+          - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+          # Install project dependencies
+          - composer install
+          - composer install --working-dir=tools/php-cs-fixer
+
+          # Lint
+          - composer lint-fix
+
+          # Use pipelines environmet variables for bitbucket mysql service database
+          - ln -f -s .env.test.pipelines .env.test
+
+          # Run migrations and fixtures on bitbucket mysql service database
+          - php bin/console cache:clear --env=test
+          - php bin/console doctrine:migrations:migrate --allow-no-migration --no-interaction --env=test
+          # - php bin/console doctrine:fixtures:load --group=test --no-interaction --env=test
+
+          # Test
+          - composer test
+        services: 
+          - mysql
+
+    - step: &buildAndDeploy
+        name: Build and Deploy to Google Cloud Run
+        image: google/cloud-sdk:latest
+        caches:
+          - docker
+        script:
+          # Export Bitbucket deployment environment variables (Repository settings > Pipelines > Deployments)
+          - export HOSTNAME=$GCR_HOSTNAME
+          - export REGION=$GCR_REGION
+          - export SERVICE_NAME=$GCR_SERVICE_NAME
+
+          # Export Bitbucket repository environment variables (Repository settings > Pipelines > Repository variables)
+          - export PROJECT_ID=$GCR_PROJECT_ID
+          - export PLATFORM=$GCR_PLATFORM
+          - export SERVICE_ACCOUNT=$GCP_SERVICE_ACCOUNT
+
+          # Decode GCP service account key and activate GCP service account
+          - echo $GCP_SERVICE_ACCOUNT_KEY | base64 -di > /tmp/key-file.json # Decode and save service account key
+          - gcloud auth activate-service-account $SERVICE_ACCOUNT --key-file=/tmp/key-file.json
+
+          # Decode docker container key and configure image registry with gcloud helper
+          - echo $DOCKER_CONTAINER_KEY | base64 -di > /tmp/docker-container-key-file # Decode and save docker container key
+          - gcloud auth configure-docker -q
+
+          # Build and push docker image to google container registry
+          - export IMAGE_NAME=$HOSTNAME/$PROJECT_ID/$SERVICE_NAME
+          - >-
+            docker build
+            --build-arg SSH_PRIVATE_KEY="$(cat /tmp/docker-container-key-file)"
+            --build-arg CONTAINER_ENV_VAR_APP_ENV=$APP_ENV
+            --build-arg CONTAINER_ENV_VAR_APP_SECRET=$APP_SECRET
+            --build-arg CONTAINER_ENV_VAR_DATABASE_URL=$DATABASE_URL
+            --build-arg CONTAINER_ENV_VAR_KERNEL_CLASS=$KERNEL_CLASS
+            --build-arg CONTAINER_ENV_VAR_SYMFONY_DEPRECATIONS_HELPER=$SYMFONY_DEPRECATIONS_HELPER
+            --build-arg CONTAINER_ENV_VAR_PANTHER_APP_ENV=$PANTHER_APP_ENV
+            --build-arg CONTAINER_ENV_VAR_PANTHER_ERROR_SCREENSHOT_DIR=$PANTHER_ERROR_SCREENSHOT_DIR
+            -t $IMAGE_NAME .
+          - docker push $IMAGE_NAME
+
+          # Deploy to Google Cloud Run services
+          - gcloud beta run deploy $SERVICE_NAME --image $IMAGE_NAME --platform $PLATFORM --region $REGION --project $PROJECT_ID
+        services:
+          - docker
+
+pipelines:
+  pull-requests:
+    '**': # Run on each pull-request
+      - step: *lintAndTest
+  branches: # Branch specific pipelines definitions
+    develop:
+      - step: *lintAndTest
+      - step:
+          <<: *buildAndDeploy
+          deployment: Staging
+    master:
+      - step: *lintAndTest
+  custom: # Manually executed pipelines definitions
+    deploy-2-staging:
+      - step:
+          <<: *buildAndDeploy
+          deployment: Staging # Bitbucket repository "Staging" environment (Repository settings > Pipelines > Deployments)
+    deploy-2-production:
+      - step:
+          <<: *buildAndDeploy
+          deployment: Production # Bitbucket repository "Production" environment (Repository settings > Pipelines > Deployments)

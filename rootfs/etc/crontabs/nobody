@@ -1,0 +1,3 @@
+# * * * * * curl --silent https://domain.com/endpoint
+# * * * * * /path-2-script/script.sh
+#
